@@ -1,0 +1,344 @@
+Coverage map 3d · HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SAR Drone — 3D Coverage Map</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    background: #0b0f14;
+    font-family: 'Segoe UI', Arial, sans-serif;
+  }
+  #ui {
+    position: absolute; top: 16px; left: 16px; z-index: 10;
+    color: #e8f1ee; max-width: 320px;
+  }
+  #ui h1 {
+    font-size: 18px; margin: 0 0 4px 0; color: #4fd1a5;
+    letter-spacing: 0.5px;
+  }
+  #ui p { font-size: 12px; color: #9fb3ac; margin: 0 0 12px 0; }
+  .legend { display: flex; gap: 14px; margin-bottom: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  #status {
+    background: rgba(20, 28, 34, 0.85);
+    border: 1px solid #234238;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  #status .label { color: #7fa89c; }
+  #status .val { color: #ffffff; font-weight: 600; }
+  #status .alert { color: #ff6b6b; font-weight: 700; }
+  #restartBtn {
+    margin-top: 10px;
+    background: #1a2b26;
+    border: 1px solid #4fd1a5;
+    color: #4fd1a5;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  #restartBtn:hover { background: #234238; }
+  #log {
+    position: absolute; bottom: 16px; left: 16px; z-index: 10;
+    color: #7fa89c; font-size: 11px; max-width: 380px;
+    max-height: 140px; overflow-y: auto;
+    background: rgba(20, 28, 34, 0.7);
+    border-radius: 6px; padding: 8px 10px;
+  }
+  #log div { margin-bottom: 3px; }
+  #log .r { color: #ff6b6b; }
+  #log .g { color: #4fd1a5; }
+</style>
+</head>
+<body>
+ 
+<div id="ui">
+  <h1>⚡ SAR Drone — Live Coverage Map</h1>
+  <p>Grey = not yet scanned · Green = scanned, clear · Red = alert (victim / hazard)</p>
+  <div class="legend">
+    <div class="legend-item"><span class="swatch" style="background:#4a4a4a"></span> Unscanned</div>
+    <div class="legend-item"><span class="swatch" style="background:#2ecc71"></span> Clear</div>
+    <div class="legend-item"><span class="swatch" style="background:#e74c3c"></span> Alert</div>
+  </div>
+  <div id="status">
+    <div><span class="label">Zone scanning:</span> <span class="val" id="curZone">—</span></div>
+    <div><span class="label">Zones covered:</span> <span class="val" id="covered">0 / 0</span></div>
+    <div><span class="label">Alerts found:</span> <span class="alert" id="alerts">0</span></div>
+  </div>
+  <button id="restartBtn">↻ Restart Scan</button>
+</div>
+ 
+<div id="log"></div>
+ 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- CONFIG ----------
+const GRID_SIZE = 5;        // 5x5 grid of zones
+const CELL_SIZE = 2.2;
+const DWELL_TIME = 700;     // ms drone spends "scanning" each cell
+const ALERT_CHANCE = 0.22;  // ~22% of zones will be flagged as alert (for demo purposes)
+ 
+// ---------- SCENE SETUP ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0f14);
+scene.fog = new THREE.Fog(0x0b0f14, 18, 40);
+ 
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(9, 11, 12);
+camera.lookAt(0, 0, 0);
+ 
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+ 
+// Lights
+scene.add(new THREE.AmbientLight(0x8899aa, 0.7));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+dirLight.position.set(10, 20, 10);
+scene.add(dirLight);
+const rimLight = new THREE.PointLight(0x4fd1a5, 0.6, 40);
+rimLight.position.set(-10, 8, -10);
+scene.add(rimLight);
+ 
+// Ground base
+const groundGeo = new THREE.PlaneGeometry(40, 40);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x0e1a17, roughness: 1 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.05;
+scene.add(ground);
+ 
+// ---------- GRID OF ZONE CELLS ----------
+const offset = (GRID_SIZE - 1) * CELL_SIZE / 2;
+const zoneCells = []; // {mesh, edgeMesh, status, row, col, label}
+const zoneOrder = [];
+const COLORS = {
+  unscanned: 0x4a4a4a,
+  scanned: 0x2ecc71,
+  alert: 0xe74c3c
+};
+ 
+function labelFor(row, col) {
+  const rowLetter = String.fromCharCode(65 + row); // A, B, C...
+  return `${rowLetter}${col + 1}`;
+}
+ 
+for (let row = 0; row < GRID_SIZE; row++) {
+  for (let col = 0; col < GRID_SIZE; col++) {
+    const geo = new THREE.BoxGeometry(CELL_SIZE * 0.92, 0.25, CELL_SIZE * 0.92);
+    const mat = new THREE.MeshStandardMaterial({
+      color: COLORS.unscanned,
+      roughness: 0.6,
+      metalness: 0.1,
+      emissive: 0x000000
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(col * CELL_SIZE - offset, 0.1, row * CELL_SIZE - offset);
+    scene.add(mesh);
+ 
+    const edges = new THREE.EdgesGeometry(geo);
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0x1a2b26 });
+    const edgeMesh = new THREE.LineSegments(edges, edgeMat);
+    edgeMesh.position.copy(mesh.position);
+    scene.add(edgeMesh);
+ 
+    const willAlert = Math.random() < ALERT_CHANCE;
+    const cellData = {
+      mesh, edgeMesh, status: 'unscanned',
+      row, col, willAlert,
+      label: labelFor(row, col)
+    };
+    zoneCells.push(cellData);
+    zoneOrder.push(cellData);
+  }
+}
+ 
+// Snake path ordering (so drone moves naturally row by row, alternating direction)
+zoneOrder.length = 0;
+for (let row = 0; row < GRID_SIZE; row++) {
+  const rowCells = zoneCells.filter(c => c.row === row);
+  if (row % 2 === 1) rowCells.reverse();
+  zoneOrder.push(...rowCells);
+}
+ 
+// ---------- DRONE ----------
+const droneGroup = new THREE.Group();
+ 
+const bodyGeo = new THREE.ConeGeometry(0.35, 0.5, 4);
+const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffcc55, emissive: 0x663300, emissiveIntensity: 0.3 });
+const body = new THREE.Mesh(bodyGeo, bodyMat);
+body.rotation.x = Math.PI;
+droneGroup.add(body);
+ 
+// simple rotor arms
+for (let i = 0; i < 4; i++) {
+  const armGeo = new THREE.BoxGeometry(0.9, 0.05, 0.05);
+  const armMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+  const arm = new THREE.Mesh(armGeo, armMat);
+  arm.rotation.y = (Math.PI / 4) + (i * Math.PI / 2);
+  droneGroup.add(arm);
+ 
+  const rotorGeo = new THREE.CylinderGeometry(0.18, 0.18, 0.03, 12);
+  const rotorMat = new THREE.MeshStandardMaterial({ color: 0x4fd1a5, transparent: true, opacity: 0.5 });
+  const rotor = new THREE.Mesh(rotorGeo, rotorMat);
+  const dx = Math.cos((Math.PI / 4) + (i * Math.PI / 2)) * 0.45;
+  const dz = Math.sin((Math.PI / 4) + (i * Math.PI / 2)) * 0.45;
+  rotor.position.set(dx, 0, dz);
+  droneGroup.add(rotor);
+}
+ 
+// scanning beam (cone light effect, purely visual)
+const beamGeo = new THREE.ConeGeometry(0.9, 1.4, 24, 1, true);
+const beamMat = new THREE.MeshBasicMaterial({ color: 0x4fd1a5, transparent: true, opacity: 0.12, side: THREE.DoubleSide });
+const beam = new THREE.Mesh(beamGeo, beamMat);
+beam.position.y = -0.9;
+droneGroup.add(beam);
+ 
+droneGroup.position.set(zoneOrder[0].mesh.position.x, 2.4, zoneOrder[0].mesh.position.z);
+scene.add(droneGroup);
+ 
+// ---------- CAMERA AUTO-ORBIT (manual, since OrbitControls not used) ----------
+let angle = 0.7;
+const radius = 15;
+function updateCamera() {
+  angle += 0.0009;
+  camera.position.x = Math.sin(angle) * radius;
+  camera.position.z = Math.cos(angle) * radius;
+  camera.position.y = 11;
+  camera.lookAt(0, 0, 0);
+}
+ 
+// ---------- SCAN LOGIC ----------
+let currentIndex = 0;
+let coveredCount = 0;
+let alertCount = 0;
+const totalZones = zoneOrder.length;
+let dwellTimer = 0;
+let scanning = true;
+const clock = new THREE.Clock();
+ 
+const curZoneEl = document.getElementById('curZone');
+const coveredEl = document.getElementById('covered');
+const alertsEl = document.getElementById('alerts');
+const logEl = document.getElementById('log');
+coveredEl.textContent = `0 / ${totalZones}`;
+ 
+function logEvent(text, cls) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  if (cls) div.className = cls;
+  logEl.prepend(div);
+  while (logEl.children.length > 8) logEl.removeChild(logEl.lastChild);
+}
+ 
+function markCell(cellData) {
+  const isAlert = cellData.willAlert;
+  cellData.status = isAlert ? 'alert' : 'scanned';
+  const targetColor = isAlert ? COLORS.alert : COLORS.scanned;
+  cellData.mesh.material.color.setHex(targetColor);
+  cellData.mesh.material.emissive.setHex(isAlert ? 0x330000 : 0x003311);
+  cellData.mesh.material.emissiveIntensity = isAlert ? 0.6 : 0.3;
+ 
+  // little pop animation
+  cellData.mesh.scale.set(1, 1.8, 1);
+ 
+  coveredCount++;
+  if (isAlert) {
+    alertCount++;
+    logEvent(`⚠ Zone ${cellData.label} — ALERT (victim / hazard detected)`, 'r');
+  } else {
+    logEvent(`✓ Zone ${cellData.label} — clear`, 'g');
+  }
+  coveredEl.textContent = `${coveredCount} / ${totalZones}`;
+  alertsEl.textContent = alertCount;
+}
+ 
+function resetScan() {
+  currentIndex = 0;
+  coveredCount = 0;
+  alertCount = 0;
+  scanning = true;
+  logEl.innerHTML = '';
+  coveredEl.textContent = `0 / ${totalZones}`;
+  alertsEl.textContent = 0;
+  zoneOrder.forEach(c => {
+    c.status = 'unscanned';
+    c.willAlert = Math.random() < ALERT_CHANCE;
+    c.mesh.material.color.setHex(COLORS.unscanned);
+    c.mesh.material.emissive.setHex(0x000000);
+    c.mesh.scale.set(1, 1, 1);
+  });
+  droneGroup.position.set(zoneOrder[0].mesh.position.x, 2.4, zoneOrder[0].mesh.position.z);
+  logEvent('Scan restarted.');
+}
+ 
+document.getElementById('restartBtn').addEventListener('click', resetScan);
+ 
+// ---------- ANIMATE ----------
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = clock.getDelta() * 1000;
+  updateCamera();
+ 
+  // rotor spin
+  droneGroup.children.forEach((child, i) => {
+    if (child.geometry && child.geometry.type === 'CylinderGeometry') {
+      child.rotation.y += 0.6;
+    }
+  });
+ 
+  // gentle hover bob
+  droneGroup.position.y = 2.4 + Math.sin(Date.now() * 0.003) * 0.08;
+ 
+  // shrink pop-scale back to normal smoothly
+  zoneCells.forEach(c => {
+    if (c.mesh.scale.y > 1) c.mesh.scale.y = Math.max(1, c.mesh.scale.y - 0.06);
+  });
+ 
+  if (scanning && currentIndex < zoneOrder.length) {
+    const target = zoneOrder[currentIndex];
+    const tx = target.mesh.position.x;
+    const tz = target.mesh.position.z;
+ 
+    // move drone toward target cell
+    droneGroup.position.x += (tx - droneGroup.position.x) * 0.08;
+    droneGroup.position.z += (tz - droneGroup.position.z) * 0.08;
+ 
+    curZoneEl.textContent = `Zone ${target.label}`;
+ 
+    const dist = Math.hypot(droneGroup.position.x - tx, droneGroup.position.z - tz);
+    if (dist < 0.05) {
+      dwellTimer += delta;
+      if (dwellTimer >= DWELL_TIME && target.status === 'unscanned') {
+        markCell(target);
+      }
+      if (dwellTimer >= DWELL_TIME + 150) {
+        dwellTimer = 0;
+        currentIndex++;
+        if (currentIndex >= zoneOrder.length) {
+          scanning = false;
+          curZoneEl.textContent = 'Scan complete';
+          logEvent(`Scan complete — ${alertCount} alert zone(s) found.`);
+        }
+      }
+    }
+  }
+ 
+  renderer.render(scene, camera);
+}
+animate();
+ 
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
